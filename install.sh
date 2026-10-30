@@ -1,49 +1,72 @@
 #!/bin/bash
-set -e
+# Install or update hdr-always-on for the current user.
+set -euo pipefail
 
 REPO="autonomath/hdr-always-on"
-BRANCH="main"
+BRANCH="${HDR_ALWAYS_ON_BRANCH:-main}"
 BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
 
-INSTALL_DIR="$HOME/.local/bin"
+LABEL="com.autonomath.hdr-always-on"
+OLD_LABEL="com.user.enable-hdr"
+DOMAIN="gui/$(id -u)"
+BIN_DIR="$HOME/.local/bin"
+BINARY="$BIN_DIR/hdr-always-on"
 PLIST_DIR="$HOME/Library/LaunchAgents"
-PLIST_NAME="com.user.enable-hdr"
+PLIST="$PLIST_DIR/$LABEL.plist"
+LOG_FILE="$HOME/Library/Logs/hdr-always-on.log"
 
 echo "Installing hdr-always-on..."
 
-# Detect if running from a local clone or via curl
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
 
-if [ -f "$SCRIPT_DIR/enable-hdr.sh" ] && [ -f "$SCRIPT_DIR/com.user.enable-hdr.plist" ]; then
-    echo "Installing from local files..."
-    ENABLE_HDR="$(cat "$SCRIPT_DIR/enable-hdr.sh")"
-    PLIST_TEMPLATE="$(cat "$SCRIPT_DIR/com.user.enable-hdr.plist")"
-else
-    echo "Downloading from GitHub..."
-    ENABLE_HDR="$(curl -fsSL "$BASE_URL/enable-hdr.sh")"
-    PLIST_TEMPLATE="$(curl -fsSL "$BASE_URL/com.user.enable-hdr.plist")"
+# Use the files next to this script when it runs from a clone, otherwise download them.
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 
-# Create install directory
-mkdir -p "$INSTALL_DIR"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/bin/hdr-always-on" ] && [ -f "$SCRIPT_DIR/$LABEL.plist" ]; then
+    echo "Using files from $SCRIPT_DIR"
+    cp "$SCRIPT_DIR/bin/hdr-always-on" "$WORK_DIR/hdr-always-on"
+    cp "$SCRIPT_DIR/$LABEL.plist" "$WORK_DIR/agent.plist"
+else
+    echo "Downloading from GitHub..."
+    curl -fsSL "$BASE_URL/bin/hdr-always-on" -o "$WORK_DIR/hdr-always-on"
+    curl -fsSL "$BASE_URL/$LABEL.plist" -o "$WORK_DIR/agent.plist"
+fi
+chmod 755 "$WORK_DIR/hdr-always-on"
+"$WORK_DIR/hdr-always-on" --version >/dev/null
 
-# Install script
-echo "$ENABLE_HDR" > "$INSTALL_DIR/enable-hdr.sh"
-chmod +x "$INSTALL_DIR/enable-hdr.sh"
+# Stop the running agent and remove the older shell-script version.
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+launchctl bootout "$DOMAIN/$OLD_LABEL" 2>/dev/null || true
+rm -f "$PLIST_DIR/$OLD_LABEL.plist" "$BIN_DIR/enable-hdr.sh"
 
-# Install LaunchAgent with correct path
-echo "$PLIST_TEMPLATE" | sed "s|__SCRIPT_PATH__|$INSTALL_DIR/enable-hdr.sh|g" \
-    > "$PLIST_DIR/$PLIST_NAME.plist"
+mkdir -p "$BIN_DIR" "$PLIST_DIR" "$(dirname "$LOG_FILE")"
+install -m 755 "$WORK_DIR/hdr-always-on" "$BINARY"
+sed -e "s|__BINARY_PATH__|$BINARY|g" -e "s|__LOG_PATH__|$LOG_FILE|g" "$WORK_DIR/agent.plist" > "$PLIST"
+plutil -lint -s "$PLIST"
 
-# Unload if already running
-launchctl unload "$PLIST_DIR/$PLIST_NAME.plist" 2>/dev/null || true
-
-# Load
-launchctl load "$PLIST_DIR/$PLIST_NAME.plist"
+# Clear any earlier `launchctl disable`, which would otherwise keep the agent from loading.
+launchctl enable "$DOMAIN/$LABEL"
+loaded=0
+for _ in 1 2 3 4 5; do
+    if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then
+        loaded=1
+        break
+    fi
+    sleep 1
+done
+if [ "$loaded" -ne 1 ]; then
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+fi
 
 echo ""
-echo "Done! HDR will be enabled on all external displays at login and every 15 minutes."
-echo "Logs: /tmp/enable-hdr.log"
+echo "Done. hdr-always-on checks your external displays after wake, unlock, and display changes, and every 15 minutes."
 echo ""
-echo "To uninstall:"
-echo "  curl -fsSL https://raw.githubusercontent.com/$REPO/$BRANCH/uninstall.sh | bash"
+"$BINARY" list || true
+echo ""
+echo "Leave a display alone:  $BINARY exclude \"DISPLAY NAME\""
+echo "Log:                    $LOG_FILE"
+echo "Uninstall:              curl -fsSL $BASE_URL/uninstall.sh | bash"

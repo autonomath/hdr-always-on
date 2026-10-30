@@ -1,0 +1,63 @@
+#!/bin/bash
+# Installer postinstall: installs hdr-always-on for the user who ran the installer.
+set -euo pipefail
+
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+LABEL="com.autonomath.hdr-always-on"
+OLD_LABEL="com.user.enable-hdr"
+
+if [ "$(id -u)" -eq 0 ]; then
+    TARGET_USER="${USER:-}"
+    if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+        TARGET_USER="$(stat -f %Su /dev/console)"
+    fi
+else
+    TARGET_USER="$(id -un)"
+fi
+TARGET_UID="$(id -u "$TARGET_USER")"
+TARGET_HOME="$(dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')"
+DOMAIN="gui/$TARGET_UID"
+
+BINARY="$TARGET_HOME/.local/bin/hdr-always-on"
+PLIST="$TARGET_HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_FILE="$TARGET_HOME/Library/Logs/hdr-always-on.log"
+
+# Write as the target user so new folders and files belong to them.
+as_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        sudo -u "$TARGET_USER" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Stop the running agent and remove the older shell-script version.
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+launchctl bootout "$DOMAIN/$OLD_LABEL" 2>/dev/null || true
+as_user rm -f "$TARGET_HOME/Library/LaunchAgents/$OLD_LABEL.plist" "$TARGET_HOME/.local/bin/enable-hdr.sh"
+
+as_user mkdir -p "$(dirname "$BINARY")" "$(dirname "$PLIST")" "$(dirname "$LOG_FILE")"
+
+# The installer's temporary folder may not be readable by the user, so stream the files.
+# The binary goes to a new file that replaces the old one, which keeps macOS from reusing a cached signature.
+as_user tee "$BINARY.new" < "$SOURCE_DIR/hdr-always-on" > /dev/null
+as_user chmod 755 "$BINARY.new"
+as_user mv -f "$BINARY.new" "$BINARY"
+sed -e "s|__BINARY_PATH__|$BINARY|g" -e "s|__LOG_PATH__|$LOG_FILE|g" "$SOURCE_DIR/$LABEL.plist" \
+    | as_user tee "$PLIST" > /dev/null
+
+# Clear any earlier `launchctl disable`, which would otherwise keep the agent from loading.
+launchctl enable "$DOMAIN/$LABEL"
+loaded=0
+for _ in 1 2 3 4 5; do
+    if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then
+        loaded=1
+        break
+    fi
+    sleep 1
+done
+if [ "$loaded" -ne 1 ]; then
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+fi
+
+exit 0
